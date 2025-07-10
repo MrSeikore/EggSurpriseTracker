@@ -1,28 +1,42 @@
-import requests
+import os
+import sys
 import json
 import time
+import shutil
+import threading
+import webbrowser
+import pyperclip
+from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 import pytz
-import os
-import sys
+import requests
 import tkinter as tk
-from tkinter import ttk, messagebox
-import threading
-import webbrowser
-import pyperclip  # Для работы с буфером обмена
+from tkinter import ttk, messagebox, filedialog
 
 # Скрываем консоль при запуске через ярлык
 if sys.executable.endswith("pythonw.exe"):
     sys.stdout = open(os.devnull, 'w')
     sys.stderr = open(os.devnull, 'w')
 
-# Конфигурация
+# Конфигурация путей
+APP_NAME = "EggSurpriseTracker"
+CONFIG_DIR = Path(os.getenv('APPDATA')) / APP_NAME  # Windows
+if not os.name == 'nt':  # Для Linux/Mac
+    CONFIG_DIR = Path.home() / f".{APP_NAME.lower()}"
+
+# Создаем папку для данных, если её нет
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
+# Пути к файлам
+CONFIG_FILE = str(CONFIG_DIR / "config.json")
+HISTORY_FILE = str(CONFIG_DIR / "inventory_history.json")
+OLD_HISTORY_FILE = "inventory_history.json"  # Для миграции старых данных
+
+# API endpoints
 INVENTORY_API = "https://egg-surprise.shop/api/inventory/get"
 ITEMS_API = "https://egg-surprise.shop/api/get-all-items"
-CONFIG_FILE = "config.json"
 CHECK_INTERVAL = 600  # 10 минут
-HISTORY_FILE = "inventory_history.json"
 TIMEZONE = pytz.timezone('Europe/Moscow')
 
 class AuthWindow:
@@ -41,7 +55,6 @@ class AuthWindow:
         
         ttk.Label(main_frame, text="Введите токен авторизации:", font=('Arial', 12)).pack(pady=10)
         
-        # Фрейм для поля ввода и кнопки вставки
         entry_frame = ttk.Frame(main_frame)
         entry_frame.pack(pady=5)
         
@@ -61,7 +74,6 @@ class AuthWindow:
         self.status_label = ttk.Label(main_frame, text="", foreground="red")
         self.status_label.pack()
         
-        # Привязываем Enter к авторизации
         self.root.bind('<Return>', lambda e: self.authenticate())
     
     def paste_from_clipboard(self):
@@ -82,7 +94,6 @@ class AuthWindow:
         self.status_label.config(text="Проверка токена...")
         self.root.update()
         
-        # Проверяем токен
         if self.check_token(token):
             self.save_token(token)
             self.on_auth_success(token)
@@ -123,18 +134,40 @@ class InventoryTracker:
         self.search_query = tk.StringVar()
         self.selected_date = tk.StringVar(value=self.get_current_date_key())
         
-        self.setup_ui()  # Сначала создаем интерфейс
-        self.load_history()
+        self.migrate_old_data()
+        self.setup_ui()
         self.load_items_info()
+        self.refresh_data()  # Автоматическое обновление при запуске
         
-        if not self.history:
-            self.status("Первоначальная история не найдена. Загружаю текущий инвентарь...")
-            self.initialize_first_run()
-        else:
-            self.update_inventory_display()
+        # Запускаем автообновление
+        self.start_auto_refresh()
+
+    def start_auto_refresh(self):
+        """Запускает автоматическое обновление данных"""
+        self.auto_refresh()
+
+    def auto_refresh(self):
+        """Периодически обновляет данные"""
+        if self.tracking_active:
+            self.refresh_data()
+            self.root.after(CHECK_INTERVAL * 1000, self.auto_refresh)
+
+    def migrate_old_data(self):
+        """Переносит старые файлы из текущей директории в AppData"""
+        old_files = {
+            "config.json": CONFIG_FILE,
+            OLD_HISTORY_FILE: HISTORY_FILE
+        }
+        
+        for old_name, new_path in old_files.items():
+            if os.path.exists(old_name) and not os.path.exists(new_path):
+                try:
+                    shutil.move(old_name, new_path)
+                    print(f"Перенесён {old_name} -> {new_path}")
+                except Exception as e:
+                    print(f"Ошибка переноса {old_name}: {e}")
 
     def get_current_date_key(self):
-        """Возвращает текущую дату в формате YYYY-MM-DD"""
         return datetime.now(TIMEZONE).strftime("%Y-%m-%d")
 
     def setup_ui(self):
@@ -143,7 +176,6 @@ class InventoryTracker:
         self.root.configure(bg='#f0f0f0')
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # Стили
         style = ttk.Style()
         style.theme_use('clam')
         
@@ -166,26 +198,21 @@ class InventoryTracker:
         style.configure('Treeview.Heading', background='#2c4d7f', foreground='white',
                       font=('Segoe UI', 10, 'bold'), borderwidth=1, padding=5)
 
-        # Главный контейнер
         main_frame = ttk.Frame(self.root)
         main_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-        # Шапка приложения
         header_frame = ttk.Frame(main_frame, style='Header.TFrame')
         header_frame.pack(fill=tk.X, pady=(0, 10), ipady=10)
 
-        # Логотип и название
         title_frame = ttk.Frame(header_frame, style='Header.TFrame')
         title_frame.pack(side=tk.LEFT, padx=10)
         ttk.Label(title_frame, text="Egg Surprise", style='Header.TLabel', 
                 font=('Segoe UI', 14, 'bold')).pack(side=tk.LEFT)
         ttk.Label(title_frame, text="Трекер инвентаря", style='Header.TLabel').pack(side=tk.LEFT, padx=(5,0))
 
-        # Панель инструментов
         tool_frame = ttk.Frame(header_frame, style='Header.TFrame')
         tool_frame.pack(side=tk.RIGHT, padx=10)
 
-        # Кнопки
         self.refresh_btn = ttk.Button(tool_frame, text="🔄 Обновить", 
                                     command=self.refresh_data, style='TButton')
         self.refresh_btn.pack(side=tk.LEFT, padx=5)
@@ -198,6 +225,10 @@ class InventoryTracker:
                               command=self.export_data, style='TButton')
         export_btn.pack(side=tk.LEFT, padx=5)
         
+        import_btn = ttk.Button(tool_frame, text="📥 Импорт истории", 
+                              command=self.show_import_dialog, style='TButton')
+        import_btn.pack(side=tk.LEFT, padx=5)
+        
         self.filter_btn = ttk.Button(tool_frame, text="👁️ Показать все", 
                               command=self.toggle_filter, style='TButton')
         self.filter_btn.pack(side=tk.LEFT, padx=5)
@@ -206,11 +237,9 @@ class InventoryTracker:
                               command=self.logout, style='TButton')
         logout_btn.pack(side=tk.LEFT, padx=5)
 
-        # Панель управления
         control_frame = ttk.Frame(main_frame)
         control_frame.pack(fill=tk.X, pady=5)
 
-        # Выбор даты
         date_frame = ttk.Frame(control_frame)
         date_frame.pack(side=tk.LEFT, padx=10)
         ttk.Label(date_frame, text="📅 Дата:").pack(side=tk.LEFT)
@@ -226,7 +255,6 @@ class InventoryTracker:
         next_day_btn = ttk.Button(date_frame, text="▶", command=self.next_day, width=3)
         next_day_btn.pack(side=tk.LEFT, padx=2)
 
-        # Поиск
         search_frame = ttk.Frame(control_frame)
         search_frame.pack(side=tk.LEFT, padx=10)
         ttk.Label(search_frame, text="🔍 Поиск:").pack(side=tk.LEFT)
@@ -234,7 +262,6 @@ class InventoryTracker:
         self.search_entry.pack(side=tk.LEFT, padx=5)
         self.search_entry.bind("<KeyRelease>", lambda e: self.update_inventory_display())
 
-        # Сортировка
         sort_frame = ttk.Frame(control_frame)
         sort_frame.pack(side=tk.RIGHT, padx=5)
         ttk.Label(sort_frame, text="Сортировка:").pack(side=tk.LEFT)
@@ -245,7 +272,6 @@ class InventoryTracker:
         self.sort_combo.set("Количество")
         self.sort_combo.bind("<<ComboboxSelected>>", self.change_sort)
 
-        # Таблица с данными
         self.tree_frame = ttk.Frame(main_frame)
         self.tree_frame.pack(fill=tk.BOTH, expand=True)
         
@@ -253,7 +279,6 @@ class InventoryTracker:
                                columns=("id", "name_ru", "name_en", "initial", "current", "change"), 
                                show="headings")
         
-        # Настройка колонок
         self.tree.heading("id", text="ID", command=lambda: self.sort_by_column("id"))
         self.tree.column("id", width=80, anchor=tk.CENTER)
         
@@ -272,25 +297,52 @@ class InventoryTracker:
         self.tree.heading("change", text="Изменение", command=lambda: self.sort_by_column("change"))
         self.tree.column("change", width=100, anchor=tk.CENTER)
         
-        # Цвета строк
         self.tree.tag_configure('evenrow', background='#f8f8f8')
         self.tree.tag_configure('oddrow', background='#ffffff')
         self.tree.tag_configure('positive', foreground='green')
         self.tree.tag_configure('negative', foreground='red')
         
-        # Полоса прокрутки
         scrollbar = ttk.Scrollbar(self.tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         
-        # Статус бар
         self.status_var = tk.StringVar()
         status_bar = ttk.Frame(main_frame)
         status_bar.pack(fill=tk.X, pady=(5,0))
         ttk.Label(status_bar, textvariable=self.status_var, 
                  background='#2c4d7f', foreground='white',
                  anchor=tk.W, padding=5).pack(fill=tk.X)
+
+    def show_import_dialog(self):
+        """Показывает диалог выбора файла для импорта"""
+        file_path = filedialog.askopenfilename(
+            title="Выберите файл истории",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if file_path:
+            self.import_history(file_path)
+
+    def import_history(self, file_path):
+        """Полностью заменяет текущую историю на импортированную"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                imported_data = json.load(f)
+                
+            if not isinstance(imported_data, dict):
+                raise ValueError("Неверный формат файла истории")
+            
+            # Полная замена истории
+            self.history = imported_data
+            self.save_history()
+            
+            # Обновляем интерфейс
+            self.update_date_combobox()
+            self.update_inventory_display()
+            
+            messagebox.showinfo("Успех", "История полностью заменена")
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось импортировать: {str(e)}")
 
     def on_close(self):
         """Обработчик закрытия окна"""
@@ -495,50 +547,57 @@ class InventoryTracker:
             self.status("Не удалось загрузить инвентарь. Проверьте токен и подключение к интернету.")
 
     def track_changes(self):
+        """Отслеживает изменения в инвентаре"""
         date_key = self.get_current_date_key()
         
         if not self.current_inventory:
             self.status("Ошибка: current_inventory не загружен")
             return
 
-        self.initialize_day(date_key)
-
-        last_state = self.history[date_key]["last_state"]
-        changes = {}
-
-        all_item_ids = set(last_state.keys()).union(set(self.current_inventory.keys()))
-        
-        for item_id in all_item_ids:
-            old_count = last_state.get(item_id, 0)
-            new_count = self.current_inventory.get(item_id, 0)
-            
-            if old_count != new_count:
-                changes[item_id] = new_count - old_count
-
-        if changes:
-            change_record = {
-                "timestamp": datetime.now(TIMEZONE).isoformat(),
-                "changes": changes
+        # Инициализируем день, если нужно
+        if date_key not in self.history:
+            self.history[date_key] = {
+                "initial": self.current_inventory.copy(),
+                "changes": [],
+                "last_state": self.current_inventory.copy()
             }
-            self.history[date_key]["changes"].append(change_record)
-            self.history[date_key]["last_state"] = self.current_inventory.copy()
-            self.save_history()
-            
-            change_messages = []
-            for item_id, delta in changes.items():
-                item_info = self.get_item_info(item_id)
-                name = item_info.get('NameRu', item_info.get('Name', f'ID {item_id}'))
-                initial_count = self.history[date_key]["initial"].get(item_id, 0)
-                current_count = self.current_inventory.get(item_id, 0)
-                
-                change_messages.append(
-                    f"- {name}: {delta:+d} (было: {initial_count}, сейчас: {current_count})"
-                )
-            
-            self.status(f"Обнаружены изменения в инвентаре:\n" + "\n".join(change_messages))
-            self.update_inventory_display()
         else:
-            self.status("Изменений не обнаружено")
+            # Обновляем последнее состояние
+            last_state = self.history[date_key]["last_state"]
+            changes = {}
+
+            all_item_ids = set(last_state.keys()).union(set(self.current_inventory.keys()))
+            
+            for item_id in all_item_ids:
+                old_count = last_state.get(item_id, 0)
+                new_count = self.current_inventory.get(item_id, 0)
+                
+                if old_count != new_count:
+                    changes[item_id] = new_count - old_count
+
+            if changes:
+                change_record = {
+                    "timestamp": datetime.now(TIMEZONE).isoformat(),
+                    "changes": changes
+                }
+                self.history[date_key]["changes"].append(change_record)
+                self.history[date_key]["last_state"] = self.current_inventory.copy()
+                
+                change_messages = []
+                for item_id, delta in changes.items():
+                    item_info = self.get_item_info(item_id)
+                    name = item_info.get('NameRu', item_info.get('Name', f'ID {item_id}'))
+                    initial_count = self.history[date_key]["initial"].get(item_id, 0)
+                    current_count = self.current_inventory.get(item_id, 0)
+                    
+                    change_messages.append(
+                        f"- {name}: {delta:+d} (было: {initial_count}, сейчас: {current_count})"
+                    )
+                
+                self.status(f"Обнаружены изменения в инвентаре:\n" + "\n".join(change_messages))
+
+        self.save_history()
+        self.update_inventory_display()
 
     def update_inventory_display(self):
         if not self.current_inventory:
@@ -613,6 +672,7 @@ class InventoryTracker:
                 print(f"Ошибка при добавлении предмета в таблицу: {e}")
 
     def refresh_data(self):
+        """Обновляет данные инвентаря"""
         self.status("Обновление данных...")
         
         inventory_data = self.fetch_inventory()
@@ -716,6 +776,33 @@ def start_main_app(auth_root, token):
     root = tk.Tk()
     app = InventoryTracker(root, token)
     app.run()
+
+def load_saved_token():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                config = json.load(f)
+                return config.get('token')
+        except Exception:
+            return None
+    return None
+
+def main():
+    saved_token = load_saved_token()
+    
+    if saved_token:
+        auth_root = tk.Tk()
+        auth_window = AuthWindow(auth_root, lambda token: None)
+        if auth_window.check_token(saved_token):
+            auth_root.destroy()
+            root = tk.Tk()
+            app = InventoryTracker(root, saved_token)
+            app.run()
+            return
+    
+    auth_root = tk.Tk()
+    auth_window = AuthWindow(auth_root, lambda token: start_main_app(auth_root, token))
+    auth_root.mainloop()
 
 if __name__ == "__main__":
     try:
